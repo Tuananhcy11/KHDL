@@ -5,63 +5,11 @@ import sqlite3
 import urllib.parse
 import os
 import re
-import pandas as pd
-import numpy as np
-from xgboost import XGBClassifier
-
 PORT = 8000
 # Absolute path to DB file relative to this script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "Gold_D1_Merged.db")
-GLOBAL_MODEL = None
 FEATURES = ['MA10', 'MA30', 'MA50', 'RSI14', 'MACD', 'Volatility']
-
-def train_global_model():
-    global GLOBAL_MODEL
-    print("Initializing and training global XGBoost model on startup...")
-    try:
-        if not os.path.exists(DB_FILE):
-            print(f"Warning: Database {DB_FILE} not found. Cannot train model yet.")
-            return
-
-        conn = sqlite3.connect(DB_FILE)
-        # Load from the gold_analytics table containing the calculated indicators
-        df = pd.read_sql_query("SELECT * FROM gold_analytics ORDER BY Date ASC", conn)
-        conn.close()
-        
-        if df.empty:
-            print("Warning: gold_analytics table is empty.")
-            return
-            
-        # Define target: 1 if tomorrow's Close > today's Close, else 0
-        df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-        
-        # Clean rows with NaN indicators
-        clean_df = df.dropna(subset=FEATURES + ['Target'])
-        
-        X = clean_df[FEATURES]
-        y = clean_df['Target']
-        
-        # Chronological Split (70% Train, 30% Test)
-        split_idx = int(len(clean_df) * 0.7)
-        X_train = X.iloc[:split_idx]
-        y_train = y.iloc[:split_idx]
-        
-        # Train XGBoost Model
-        model = XGBClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            eval_metric='logloss'
-        )
-        model.fit(X_train, y_train)
-        GLOBAL_MODEL = model
-        print("XGBoost Global Model trained successfully! Ready for predictions.")
-    except Exception as e:
-        print(f"Error training global XGBoost model on startup: {e}")
 
 
 def remove_vietnamese_accents(text):
@@ -406,13 +354,6 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error_response(f"SQL execution error on generated query: {str(e)}")
 
     def handle_predict(self, query_params):
-        global GLOBAL_MODEL
-        if GLOBAL_MODEL is None:
-            train_global_model()
-        if GLOBAL_MODEL is None:
-            self.send_error_response("XGBoost model is not trained yet. Try again shortly.")
-            return
-
         target_date = query_params.get('date', [''])[0].strip()
         if not target_date:
             self.send_error_response("Please specify a valid 'date' parameter (YYYY-MM-DD).")
@@ -436,15 +377,20 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
             columns = ["Date", "Open", "High", "Low", "Close", "Volume", "Open_interest", "MA10", "MA30", "MA50", "RSI14", "MACD", "Volatility"]
             prev_data = dict(zip(columns, prev_row))
             
-            # Extract features for model input
-            X_input = [prev_data[f] for f in FEATURES]
+            # Fetch pre-calculated XGBoost prediction from the gold_predictions table
+            cursor.execute(
+                "SELECT Prediction, Prob_Up, Prob_Down FROM gold_predictions WHERE Date = ?", 
+                (prev_data["Date"],)
+            )
+            pred_row = cursor.fetchone()
             
-            # Predict price direction and probabilities for the target date
-            pred_class = int(GLOBAL_MODEL.predict([X_input])[0])
-            pred_proba = GLOBAL_MODEL.predict_proba([X_input])[0]
-            
-            prob_down = float(pred_proba[0])
-            prob_up = float(pred_proba[1])
+            if pred_row:
+                prediction, prob_up, prob_down = pred_row
+            else:
+                # Fallback default if not pre-calculated
+                prediction = "GIẢM"
+                prob_up = 50.0
+                prob_down = 50.0
             
             # Check if the target date actually exists in the database to verify predictions
             cursor.execute("SELECT Close FROM gold_analytics WHERE Date = ?", (target_date,))
@@ -457,8 +403,7 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
             if target_row:
                 actual_close = float(target_row[0])
                 actual_outcome = "TĂNG" if actual_close > prev_data["Close"] else "GIẢM"
-                pred_outcome_str = "TĂNG" if pred_class == 1 else "GIẢM"
-                is_correct = (pred_outcome_str == actual_outcome)
+                is_correct = (prediction == actual_outcome)
 
             conn.close()
 
@@ -476,9 +421,9 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
                     "MACD": prev_data["MACD"],
                     "Volatility": prev_data["Volatility"]
                 },
-                "prediction": "TĂNG" if pred_class == 1 else "GIẢM",
-                "prob_up": round(prob_up * 100, 2),
-                "prob_down": round(prob_down * 100, 2),
+                "prediction": prediction,
+                "prob_up": prob_up,
+                "prob_down": prob_down,
                 "actual_close": actual_close,
                 "actual_outcome": actual_outcome,
                 "is_correct": is_correct
@@ -487,9 +432,10 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error_response(str(e))
 
+class handler(GoldDBHandler):
+    pass
+
 if __name__ == "__main__":
-    train_global_model()
-    handler = GoldDBHandler
     with socketserver.TCPServer(("", PORT), handler) as httpd:
         print(f"Serving Gold Database Dashboard on http://localhost:{PORT}")
         try:
