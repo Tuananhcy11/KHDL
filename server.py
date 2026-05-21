@@ -10,7 +10,9 @@ import numpy as np
 from xgboost import XGBClassifier
 
 PORT = 8000
-DB_FILE = "Gold_D1_Merged.db"
+# Absolute path to DB file relative to this script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "Gold_D1_Merged.db")
 GLOBAL_MODEL = None
 FEATURES = ['MA10', 'MA30', 'MA50', 'RSI14', 'MACD', 'Volatility']
 
@@ -405,6 +407,8 @@ class GoldDBHandler(http.server.SimpleHTTPRequestHandler):
 
     def handle_predict(self, query_params):
         global GLOBAL_MODEL
+        if GLOBAL_MODEL is None:
+            train_global_model()
         if GLOBAL_MODEL is None:
             self.send_error_response("XGBoost model is not trained yet. Try again shortly.")
             return
